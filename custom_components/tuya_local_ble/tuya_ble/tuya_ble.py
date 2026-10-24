@@ -1973,13 +1973,17 @@ class TuyaBLEDevice:
         packet_num, pos = self._unpack_int(data, pos)
 
         if packet_num < self._input_expected_packet_num:
-            _LOGGER.error(
+            # Stale/duplicate fragment: drop it, keep any in-progress
+            # reassembly. Previously the state was reset and execution fell
+            # through, so a duplicate fragment #0 was taken as a new message
+            # and looped endlessly.
+            _LOGGER.debug(
                 "%s: Unexpcted packet (number %s) in notifications, " "expected %s",
                 self.address,
                 packet_num,
                 self._input_expected_packet_num,
             )
-            self._clean_input()
+            return
 
         if packet_num == self._input_expected_packet_num:
             if packet_num == 0:
@@ -1989,7 +1993,7 @@ class TuyaBLEDevice:
             self._input_buffer += data[pos:]
             self._input_expected_packet_num += 1
         else:
-            _LOGGER.error(
+            _LOGGER.debug(
                 "%s: Missing packet (number %s) in notifications, received %s",
                 self.address,
                 self._input_expected_packet_num,
@@ -1999,7 +2003,7 @@ class TuyaBLEDevice:
             return
 
         if len(self._input_buffer) > self._input_expected_length:
-            _LOGGER.error(
+            _LOGGER.debug(
                 "%s: Unexpcted length of data in notifications, "
                 "received %s expected %s",
                 self.address,
@@ -2009,7 +2013,15 @@ class TuyaBLEDevice:
             self._clean_input()
             return
         elif len(self._input_buffer) == self._input_expected_length:
-            self._parse_input()
+            try:
+                self._parse_input()
+            except Exception:
+                _LOGGER.warning(
+                    "%s: Failed to parse reassembled message, discarding",
+                    self.address,
+                    exc_info=True,
+                )
+                self._clean_input()
 
     async def _send_datapoints_v3(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
