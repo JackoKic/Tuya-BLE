@@ -19,6 +19,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from homeassistant.const import (
@@ -227,7 +228,7 @@ def get_mapping_by_device(device: TuyaBLEDevice) -> list[TuyaBLECategoryLockMapp
         return []
 
 
-class TuyaBLELock(TuyaBLEEntity, LockEntity):
+class TuyaBLELock(TuyaBLEEntity, RestoreEntity, LockEntity):
     """Representation of a Tuya BLE Lock."""
 
     def __init__(
@@ -267,6 +268,22 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         while not self._keep_connect_stop.wait(self._mapping.keep_connect_timer):
             if self._datapoint_nop:
                 self._hass.create_task(self._datapoint_nop.set_value(True))
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known lock state after a restart (display fallback only).
+
+        Any real update from the device overwrites it immediately; it is
+        never sent to the device.
+        """
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if (
+            self._current_state == STATE_UNKNOWN
+            and last_state is not None
+            and last_state.state in (LockState.LOCKED, LockState.UNLOCKED)
+        ):
+            self._current_state = last_state.state
+            self._update_attrs()
 
     async def async_will_remove_from_hass(self) -> None:
         """Stop keepalive thread when the entity is removed/reloaded."""
