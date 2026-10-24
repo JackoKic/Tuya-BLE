@@ -678,6 +678,29 @@ class TuyaBLEDevice:
             self._characteristic_write = CHARACTERISTIC_WRITE_FD50
             self._uses_fd50_channel = True
 
+    async def _drop_client(self) -> None:
+        """Fully tear down the current client (stop notify + disconnect).
+
+        Only setting self._client = None leaves the BLE link and its
+        notification handler alive, so every retry stacks another handler
+        and each fragment is delivered N times.
+        """
+        client = self._client
+        self._client = None
+        self._is_paired = False
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(
+                client.stop_notify(self._characteristic_notify), 5)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(client.disconnect(), 10)
+        except Exception:
+            pass
+        self._clean_input()
+
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
         global global_connect_lock
@@ -782,7 +805,7 @@ class TuyaBLEDevice:
                             bluez={"use_start_notify": True},
                         )
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
+                        await self._drop_client()
                         _LOGGER.error("%s: starting notifications failed",
                                       self.address, exc_info=True)
                         continue
@@ -809,14 +832,14 @@ class TuyaBLEDevice:
                             0,
                             True,
                         ):
-                            self._client = None
+                            await self._drop_client()
                             _LOGGER.error(
                                 "%s: Sending device info request failed",
                                 self.address,
                             )
                             continue
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
+                        await self._drop_client()
                         _LOGGER.error("%s: Sending device info request failed",
                                       self.address, exc_info=True)
                         continue
@@ -832,14 +855,14 @@ class TuyaBLEDevice:
                             0,
                             True,
                         ):
-                            self._client = None
+                            await self._drop_client()
                             _LOGGER.error(
                                 "%s: Sending pairing request failed",
                                 self.address,
                             )
                             continue
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
+                        await self._drop_client()
                         _LOGGER.error("%s: Sending pairing request failed",
                                       self.address, exc_info=True)
                         continue
