@@ -48,6 +48,9 @@ _LOGGER = logging.getLogger(__name__)
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 
+WATCHDOG_INTERVAL = 300
+WATCHDOG_PING_TIMEOUT = 20
+
 
 class TuyaBLEDataPoint:
     def __init__(
@@ -244,6 +247,7 @@ class TuyaBLEDevice:
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._expected_disconnect = False
+        self._watchdog_task: asyncio.Task | None = None
         self._connected_callbacks: list[Callable[[], None]] = []
         self._callbacks: list[Callable[[list[TuyaBLEDataPoint]], None]] = []
         self._disconnected_callbacks: list[Callable[[], None]] = []
@@ -573,10 +577,80 @@ class TuyaBLEDevice:
         """Start the TuyaBLE."""
         _LOGGER.debug("%s: Starting...", self.address)
         # await self._send_packet()
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._connection_watchdog())
+
+    async def _connection_watchdog(self) -> None:
+        """Periodically verify the connection is genuinely alive.
+
+        Normally we rely on the underlying Bleak/BlueZ disconnect callback
+        (`_disconnected`) to notice a dropped link and trigger `_reconnect()`.
+        That callback depends on the virtualization/USB passthrough layer
+        correctly delivering the disconnect event to the guest - if it
+        doesn't (observed with some Proxmox USB controller passthrough
+        configurations), `self._client.is_connected` can keep reporting
+        `True` forever even though the link is actually dead, leaving the
+        integration in a "zombie" state that never self-recovers.
+
+        This watchdog periodically (every WATCHDOG_INTERVAL seconds) sends a
+        lightweight request and forces a reconnect if it doesn't get a
+        timely response, independent of whatever the connection flag
+        claims. It only acts on a connection that is already open - it
+        never forces the device to connect or stay connected, so it adds
+        no extra radio wake-ups on its own for this battery-powered lock.
+        """
+        while not self._expected_disconnect:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            if self._expected_disconnect:
+                return
+            if self._client and self._client.is_connected and self._is_paired:
+                try:
+                    ok = await asyncio.wait_for(
+                        self._send_packet_while_connected(
+                            TuyaBLECode.FUN_SENDER_DEVICE_STATUS,
+                            bytes(),
+                            0,
+                            True,
+                        ),
+                        timeout=WATCHDOG_PING_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    ok = False
+                except Exception:
+                    _LOGGER.debug(
+                        "%s: Watchdog ping raised an error",
+                        self.address,
+                        exc_info=True,
+                    )
+                    ok = False
+
+                if not ok:
+                    _LOGGER.warning(
+                        "%s: Watchdog detected a stale connection "
+                        "(no response to keepalive), forcing reconnect; RSSI: %s",
+                        self.address,
+                        self.rssi,
+                    )
+                    client = self._client
+                    self._client = None
+                    self._is_paired = False
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            _LOGGER.debug(
+                                "%s: Watchdog cleanup disconnect failed",
+                                self.address,
+                                exc_info=True,
+                            )
+                    if not self._expected_disconnect:
+                        asyncio.create_task(self._reconnect())
 
     async def stop(self) -> None:
         """Stop the TuyaBLE."""
         _LOGGER.debug("%s: Stop", self.address)
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
         await self._execute_disconnect()
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
@@ -1997,9 +2071,8 @@ class TuyaBLEDevice:
 
         if packet_num < self._input_expected_packet_num:
             # Stale/duplicate fragment: drop it, keep any in-progress
-            # reassembly. Previously the state was reset and execution fell
-            # through, so a duplicate fragment #0 was taken as a new message
-            # and looped endlessly.
+            # reassembly. (Upstream reset state here and fell through,
+            # treating a duplicate #0 as a new message -> endless loop.)
             _LOGGER.debug(
                 "%s: Unexpcted packet (number %s) in notifications, " "expected %s",
                 self.address,
